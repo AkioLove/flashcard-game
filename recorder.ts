@@ -27,14 +27,7 @@ export class AudioRecorder {
       throw new Error('This browser does not support local audio recording.');
     }
 
-    const stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    });
-    stream.getTracks().forEach((track) => track.stop());
+    await this.ensureStream();
   }
 
   async start(): Promise<void> {
@@ -45,24 +38,23 @@ export class AudioRecorder {
       throw new Error('Audio recording is already in progress.');
     }
 
-    this.stream = await navigator.mediaDevices.getUserMedia({
-      audio: {
-        channelCount: 1,
-        echoCancellation: true,
-        noiseSuppression: true,
-      },
-    });
+    const stream = await this.ensureStream();
     this.chunks = [];
 
     try {
       const mimeType = supportedMimeType();
       this.recorder = mimeType
-        ? new MediaRecorder(this.stream, { mimeType })
-        : new MediaRecorder(this.stream);
+        ? new MediaRecorder(stream, { mimeType })
+        : new MediaRecorder(stream);
       this.recorder.addEventListener('dataavailable', (event) => {
         if (event.data.size > 0) this.chunks.push(event.data);
       });
-      this.recorder.start();
+      await new Promise<void>((resolve, reject) => {
+        const recorder = this.recorder!;
+        recorder.addEventListener('start', () => resolve(), { once: true });
+        recorder.addEventListener('error', () => reject(new Error('Audio recording failed to start.')), { once: true });
+        recorder.start();
+      });
     } catch (error) {
       this.releaseStream();
       this.recorder = null;
@@ -82,7 +74,6 @@ export class AudioRecorder {
         const blob = new Blob(this.chunks, { type });
         this.recorder = null;
         this.chunks = [];
-        this.releaseStream();
         if (blob.size === 0) reject(new Error('The browser returned an empty recording.'));
         else resolve(blob);
       };
@@ -109,7 +100,6 @@ export class AudioRecorder {
   async cancel(): Promise<void> {
     const recorder = this.recorder;
     if (!recorder || recorder.state === 'inactive') {
-      this.releaseStream();
       return;
     }
 
@@ -123,7 +113,27 @@ export class AudioRecorder {
     });
     this.recorder = null;
     this.chunks = [];
+  }
+
+  async dispose(): Promise<void> {
+    await this.cancel();
     this.releaseStream();
+  }
+
+  private async ensureStream(): Promise<MediaStream> {
+    const liveStream = this.stream?.getAudioTracks().some((track) => track.readyState === 'live');
+    if (this.stream && liveStream) return this.stream;
+
+    this.releaseStream();
+    this.stream = await navigator.mediaDevices.getUserMedia({
+      audio: {
+        channelCount: 1,
+        echoCancellation: true,
+        noiseSuppression: true,
+        autoGainControl: true,
+      },
+    });
+    return this.stream;
   }
 
   private releaseStream(): void {

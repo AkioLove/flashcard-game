@@ -13,12 +13,14 @@ const KANA = [
 const TOTAL = 20;
 const BPM = 80;
 const BEAT_MS = Math.round(60000 / BPM);
-const RECORDING_MS = Math.min(1800, BEAT_MS * 2);
+const RECORDING_MS = Math.max(1800, BEAT_MS * 2);
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
 const localSpeechSupported = Boolean(canRecordAudio() && window.Worker && window.WebAssembly);
 const app = document.querySelector('#root');
 const recorder = new AudioRecorder();
+const speechVocabulary = [...new Set(KANA.map(([kana]) => kana))];
+speechEngine.setVocabulary(speechVocabulary);
 
 let state = {
   phase: 'idle',
@@ -52,6 +54,7 @@ addLog(`MediaRecorder=${Boolean(window.MediaRecorder)}`);
 addLog(`AudioContext=${Boolean(window.AudioContext)}`);
 addLog(`WebAssembly=${Boolean(window.WebAssembly)}`);
 addLog(`iOS=${isIOS}`);
+speechEngine.setDiagnosticListener((message) => addLog(message));
 
 speechEngine.setProgressListener((progress) => {
   if (state.mic !== 'loading-model') return;
@@ -80,6 +83,7 @@ function status() {
     'loading-model': state.modelStatus === 'initializing'
       ? '模型下載完成，正在初始化 Vosk 辨識核心…'
       : `正在下載日文語音模型${state.modelProgress === null ? '…' : `（${state.modelProgress}%）`}`,
+    arming: '正在準備錄音，看到「現在唸！」再開口',
     recording: '正在錄音，請現在唸出畫面上的假名',
     transcribing: '正在手機內辨識語音…',
     error: `本機語音辨識失敗${state.lastError ? `（${state.lastError}）` : ''}。`,
@@ -144,9 +148,12 @@ function screen() {
 
   if (state.phase === 'playing') {
     const [kana] = state.round[state.index];
+    const listening = state.mic === 'recording';
+    const instruction = state.feedback
+      || (listening ? '現在唸！' : state.mic === 'transcribing' ? '辨識中…' : '準備…');
     return `<section class="game-layout">
       <div class="stats"><span>Score <b>${state.score}</b></span><span>Combo <b>${state.combo}</b></span><span>${state.index + 1} / ${TOTAL}</span></div>
-      <div class="beat-card ${state.feedback.toLowerCase()}"><div class="pulse"></div><strong>${kana}</strong><p>${state.feedback || '唸出這個音'}</p>${state.heard ? `<small>聽到：${escapeHtml(state.heard)}</small>` : ''}</div>
+      <div class="beat-card ${state.feedback.toLowerCase()} ${listening ? 'listening' : ''}"><div class="pulse"></div><strong>${kana}</strong><p>${instruction}</p>${state.heard ? `<small>聽到：${escapeHtml(state.heard)}</small>` : ''}</div>
       <p class="mic-status">🎤 ${escapeHtml(status())}</p>
       <div class="fallback-actions"><button data-correct>手動：正確</button><button data-wrong>手動：錯誤</button></div>
     </section>`;
@@ -191,7 +198,7 @@ async function startGame() {
     render();
     try {
       await recorder.requestPermission();
-      addLog('microphone permission granted');
+      addLog('microphone permission granted; stream kept warm');
       state.mic = 'loading-model';
       state.modelProgress = null;
       state.modelStatus = 'downloading';
@@ -199,8 +206,9 @@ async function startGame() {
       await speechEngine.initialize();
       state.speechReady = true;
       state.mic = 'ready';
-      addLog('Vosk Japanese small model ready');
+      addLog(`Vosk ready; vocabulary=${speechVocabulary.length}`);
     } catch (error) {
+      await recorder.dispose();
       state.mic = 'error';
       state.lastError = error.message || error.name || 'unknown';
       addLog(`speech setup error: ${error.message || error}`);
@@ -237,7 +245,7 @@ function beginBeat() {
 
   if (!localSpeechSupported) state.mic = 'unsupported';
   else if (!state.speechReady) state.mic = 'error';
-  else state.mic = 'ready';
+  else state.mic = 'arming';
   render();
 
   if (state.speechReady) void startRecording(beatId);
@@ -245,13 +253,14 @@ function beginBeat() {
 
 async function startRecording(beatId) {
   try {
+    const requestedAt = performance.now();
     await recorder.start();
     if (beatId !== state.beatId || state.answered) {
       await recorder.cancel();
       return;
     }
     state.mic = 'recording';
-    addLog('recording started');
+    addLog(`recording started; latency=${Math.round(performance.now() - requestedAt)}ms`);
     render();
     state.timer = setTimeout(() => void finishRecording(beatId), RECORDING_MS);
   } catch (error) {
@@ -291,7 +300,7 @@ function resolveBeat(ok) {
   addLog(`resolveBeat(${ok})`);
   state.answered = true;
   clearTimeout(state.timer);
-  void recorder.cancel();
+  const recorderReady = recorder.cancel();
   state.mic = state.speechReady ? 'ready' : (localSpeechSupported ? 'error' : 'unsupported');
 
   if (ok) {
@@ -306,10 +315,12 @@ function resolveBeat(ok) {
   }
   render();
 
-  setTimeout(() => {
+  setTimeout(async () => {
+    await recorderReady;
     state.index += 1;
     if (state.index >= TOTAL) {
       state.phase = 'finished';
+      await recorder.dispose();
       render();
     } else {
       beginBeat();
@@ -317,5 +328,5 @@ function resolveBeat(ok) {
   }, 450);
 }
 
-window.addEventListener('pagehide', () => void recorder.cancel());
+window.addEventListener('pagehide', () => void recorder.dispose());
 render();

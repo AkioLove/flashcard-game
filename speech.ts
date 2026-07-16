@@ -2,6 +2,7 @@ import { Model, type KaldiRecognizer } from 'vosk-browser';
 
 export interface SpeechEngine {
   initialize(): Promise<void>;
+  setVocabulary(terms: readonly string[]): void;
   transcribe(audio: Blob): Promise<string>;
 }
 
@@ -65,9 +66,23 @@ class VoskSpeechEngine implements SpeechEngine {
   private model: Model | null = null;
   private initializePromise: Promise<void> | null = null;
   private progressListener: ((progress: SpeechProgress) => void) | null = null;
+  private diagnosticListener: ((message: string) => void) | null = null;
+  private vocabulary: string[] = [];
 
   setProgressListener(listener: ((progress: SpeechProgress) => void) | null): void {
     this.progressListener = listener;
+  }
+
+  setDiagnosticListener(listener: ((message: string) => void) | null): void {
+    this.diagnosticListener = listener;
+  }
+
+  setVocabulary(terms: readonly string[]): void {
+    this.vocabulary = [...new Set(
+      terms
+        .map((term) => String(term).normalize('NFKC').trim())
+        .filter((term) => term && term !== '[unk]'),
+    )];
   }
 
   initialize(): Promise<void> {
@@ -85,10 +100,16 @@ class VoskSpeechEngine implements SpeechEngine {
   async transcribe(audio: Blob): Promise<string> {
     await this.initialize();
     const samples = await decodeAudio(audio);
-    if (rootMeanSquare(samples) < MIN_RMS) return '';
+    const rms = rootMeanSquare(samples);
+    this.diagnosticListener?.(`audio rms=${rms.toFixed(4)}; duration=${(samples.length / TARGET_SAMPLE_RATE).toFixed(2)}s`);
+    if (rms < MIN_RMS) return '';
     if (!this.model?.ready) throw new Error('Vosk model is not ready.');
 
-    const recognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE);
+    const grammar = this.vocabulary.length
+      ? JSON.stringify(['[unk]', ...this.vocabulary])
+      : undefined;
+    const recognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE, grammar);
+    recognizer.setWords(true);
     return this.recognize(recognizer, samples);
   }
 
@@ -170,6 +191,8 @@ class VoskSpeechEngine implements SpeechEngine {
   private recognize(recognizer: KaldiRecognizer, samples: Float32Array): Promise<string> {
     return new Promise((resolve, reject) => {
       const texts: string[] = [];
+      let bestWord = '';
+      let bestConfidence = -1;
       let waveformResponseReceived = false;
       let settled = false;
 
@@ -179,7 +202,11 @@ class VoskSpeechEngine implements SpeechEngine {
         window.clearTimeout(timeout);
         recognizer.remove();
         if (error) reject(error);
-        else resolve(texts.join(' ').trim());
+        else {
+          const selected = bestWord || texts.join(' ').trim();
+          this.diagnosticListener?.(`Vosk selected=${selected || '(silence)'}; confidence=${bestConfidence < 0 ? 'n/a' : bestConfidence.toFixed(3)}`);
+          resolve(selected);
+        }
       };
 
       const timeout = window.setTimeout(() => {
@@ -191,7 +218,17 @@ class VoskSpeechEngine implements SpeechEngine {
       });
       recognizer.on('result', (message) => {
         const text = 'text' in message.result ? message.result.text.trim() : '';
-        if (text) texts.push(text);
+        if (text && text !== '[unk]') texts.push(text);
+
+        const words = 'result' in message.result && Array.isArray(message.result.result)
+          ? message.result.result
+          : [];
+        for (const word of words) {
+          if (word.word !== '[unk]' && word.conf > bestConfidence) {
+            bestWord = word.word;
+            bestConfidence = word.conf;
+          }
+        }
 
         if (waveformResponseReceived) finish();
         else waveformResponseReceived = true;

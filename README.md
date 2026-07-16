@@ -22,9 +22,11 @@ No local setup is required.
 
 ## Local speech engine
 
-- Audio is captured for 1.5 seconds with `MediaRecorder` and decoded to 16 kHz mono PCM.
+- Audio is captured for 1.8 seconds with `MediaRecorder` and decoded to 16 kHz mono PCM.
 - `vosk-model-small-ja-0.22` runs locally inside Vosk's Web Worker and supports general Japanese rather than only the current five vowels.
 - The model is initialized once per page. Vosk stores it in IndexedDB so later rounds and visits do not reload it.
+- The microphone stream is opened once and reused during a round, so the visible **現在唸！** cue matches the actual recording start.
+- Each recognizer receives its vocabulary from the active kana dataset. Expanding the dataset expands the grammar without changing the speech engine.
 - No recording or transcript is sent to a backend or cloud speech API.
 - `npm run build` downloads the official Apache-2.0 model, verifies its SHA-256 checksum, and packages it for same-origin GitHub Pages delivery. The generated model archive is not committed to Git.
 

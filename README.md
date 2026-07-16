@@ -15,22 +15,29 @@ No local setup is required.
 - Vowels only: あ・い・う・え・お
 - Fixed 80 BPM rhythm
 - 20 prompts per round
-- Japanese speech recognition through `SpeechRecognition` / `webkitSpeechRecognition`
+- Local Japanese speech recognition with quantized Whisper Tiny and Transformers.js
 - Correct / wrong feedback
 - Score, combo, accuracy, and final results
 - Manual fallback buttons when speech recognition is unavailable
 
+## Local speech engine
+
+- Audio is captured for 1.5 seconds with `MediaRecorder` and decoded to 16 kHz mono PCM.
+- `onnx-community/whisper-tiny` runs locally in a Web Worker through the WASM backend at q8 precision.
+- The model is initialized once per page and browser caching avoids downloading unchanged model files again.
+- No recording or transcript is sent to a backend or cloud speech API.
+
 ## iPhone Safari
 
-- Open the GitHub Pages URL in Safari.
-- Tap **開始** and allow microphone access.
-- The app requests microphone permission from the tap event before the countdown, which is required for reliable iOS behavior.
-- Browser speech-recognition availability still depends on the installed iOS/Safari version and Apple services. If recognition is unavailable or fails, the game remains playable with manual correct/wrong controls.
+- Open the GitHub Pages URL in Safari, tap **開始**, and allow microphone access.
+- The first run downloads the local model before the countdown begins. Keep the page open until it is ready.
+- Later visits reuse the browser's model cache when available.
+- If recording or local inference fails, the manual correct/wrong controls remain available.
 
 ## Local development
 
 ```bash
-npm install
+npm install --ignore-scripts
 npm run dev
 ```
 

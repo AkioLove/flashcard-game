@@ -1,3 +1,7 @@
+import { AudioRecorder, canRecordAudio } from './recorder.ts';
+import { speechEngine } from './speech.ts';
+import { canonicalVowel } from './kana-normalize.js';
+
 const KANA = [
   ['あ', ['あ', 'ア', 'a']],
   ['い', ['い', 'イ', 'i']],
@@ -9,12 +13,12 @@ const KANA = [
 const TOTAL = 20;
 const BPM = 80;
 const BEAT_MS = Math.round(60000 / BPM);
-const SpeechRecognitionCtor = window.SpeechRecognition;
-const WebkitSpeechRecognitionCtor = window.webkitSpeechRecognition;
-const Recognition = SpeechRecognitionCtor || WebkitSpeechRecognitionCtor;
+const RECORDING_MS = Math.min(1800, BEAT_MS * 2);
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
+const localSpeechSupported = Boolean(canRecordAudio() && window.Worker && window.WebAssembly);
 const app = document.querySelector('#root');
+const recorder = new AudioRecorder();
 
 let state = {
   phase: 'idle',
@@ -26,10 +30,12 @@ let state = {
   correct: 0,
   feedback: '',
   heard: '',
-  mic: Recognition ? 'ready' : 'unsupported',
+  mic: localSpeechSupported ? 'ready' : 'unsupported',
   timer: null,
-  recognition: null,
   answered: false,
+  speechReady: false,
+  modelProgress: null,
+  beatId: 0,
   lastError: '',
   logs: [],
 };
@@ -41,53 +47,54 @@ function addLog(message) {
 }
 
 addLog(`page loaded; secureContext=${window.isSecureContext}`);
-addLog(`SpeechRecognition=${Boolean(SpeechRecognitionCtor)}`);
-addLog(`webkitSpeechRecognition=${Boolean(WebkitSpeechRecognitionCtor)}`);
-addLog(`mediaDevices=${Boolean(navigator.mediaDevices)}`);
+addLog(`MediaRecorder=${Boolean(window.MediaRecorder)}`);
+addLog(`AudioContext=${Boolean(window.AudioContext)}`);
+addLog(`WebAssembly=${Boolean(window.WebAssembly)}`);
 addLog(`iOS=${isIOS}`);
 
-const normalise = (value) => String(value || '')
-  .toLowerCase()
-  .replace(/[\s。、,.!?！？]/g, '')
-  .trim();
+speechEngine.setProgressListener((progress) => {
+  if (state.mic !== 'loading-model') return;
+  const next = Number.isFinite(progress.progress) ? Math.floor(progress.progress) : null;
+  if (next !== null && next !== state.modelProgress) {
+    state.modelProgress = next;
+    render();
+  }
+});
+
+function escapeHtml(value) {
+  return String(value || '').replace(/[&<>"']/g, (character) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#039;',
+  })[character]);
+}
 
 function status() {
   return ({
-    unsupported: '此瀏覽器沒有可用的語音辨識。',
+    unsupported: '此瀏覽器沒有可用的本機語音辨識。',
     requesting: '正在請求麥克風權限…',
-    listening: '正在聽，請現在唸出畫面上的假名',
-    waiting: isIOS ? '請點「開始收音」，再唸出假名。' : '沒有收到語音，請再試一次。',
-    error: `語音辨識失敗${state.lastError ? `（${state.lastError}）` : ''}。`,
-    ready: isIOS ? 'iPhone Safari：每一題請點一次「開始收音」。' : '準備好麥克風後開始',
+    'loading-model': `正在下載並載入本機語音模型${state.modelProgress === null ? '…' : `（${state.modelProgress}%）`}`,
+    recording: '正在錄音，請現在唸出畫面上的假名',
+    transcribing: '正在手機內辨識語音…',
+    error: `本機語音辨識失敗${state.lastError ? `（${state.lastError}）` : ''}。`,
+    ready: isIOS ? 'iPhone Safari：按開始後請允許麥克風，語音只在手機內處理。' : '語音只在此裝置內處理',
   })[state.mic] || '';
-}
-
-function stopRecognition() {
-  try {
-    if (state.recognition) {
-      addLog('abort() called');
-      state.recognition.abort();
-    }
-  } catch (error) {
-    addLog(`abort exception: ${error.name || error}`);
-  }
-  state.recognition = null;
 }
 
 function debugPanel() {
   const rows = [
-    ['SpeechRecognition', Boolean(SpeechRecognitionCtor)],
-    ['webkitSpeechRecognition', Boolean(WebkitSpeechRecognitionCtor)],
+    ['MediaRecorder', Boolean(window.MediaRecorder)],
+    ['AudioContext', Boolean(window.AudioContext)],
+    ['WebAssembly', Boolean(window.WebAssembly)],
     ['Secure context', window.isSecureContext],
     ['mediaDevices', Boolean(navigator.mediaDevices)],
     ['iPhone / iPad', isIOS],
+    ['Model ready', state.speechReady],
     ['Mic state', state.mic],
   ];
 
   return `<details class="debug-panel" open>
-    <summary>語音辨識 Debug</summary>
+    <summary>本機語音辨識 Debug</summary>
     <div class="debug-grid">${rows.map(([label, value]) => `<span>${label}</span><b>${String(value)}</b>`).join('')}</div>
-    <pre>${state.logs.join('\n')}</pre>
+    <pre>${escapeHtml(state.logs.join('\n'))}</pre>
     <button type="button" data-copy-debug>複製 Debug 資訊</button>
   </details>`;
 }
@@ -101,8 +108,6 @@ function render() {
 
   const start = document.querySelector('[data-start]');
   if (start) start.addEventListener('click', startGame);
-  const listen = document.querySelector('[data-listen]');
-  if (listen) listen.addEventListener('click', startRecognition);
   const correct = document.querySelector('[data-correct]');
   if (correct) correct.addEventListener('click', () => resolveBeat(true));
   const wrong = document.querySelector('[data-wrong]');
@@ -115,11 +120,12 @@ function render() {
 
 function screen() {
   if (state.phase === 'idle') {
+    const starting = ['requesting', 'loading-model'].includes(state.mic);
     return `<section class="panel intro">
       <h2>看到假名，立刻唸出來</h2>
       <p>本局 20 題，只練習 あ・い・う・え・お。</p>
-      <button class="primary" data-start ${state.mic === 'requesting' ? 'disabled' : ''}>${state.mic === 'requesting' ? '啟用麥克風中…' : '開始'}</button>
-      <small>${status()}</small>
+      <button class="primary" data-start ${starting ? 'disabled' : ''}>${starting ? '準備本機語音中…' : '開始'}</button>
+      <small>${escapeHtml(status())}</small>
     </section>`;
   }
 
@@ -129,15 +135,10 @@ function screen() {
 
   if (state.phase === 'playing') {
     const [kana] = state.round[state.index];
-    const listenButton = Recognition && state.mic !== 'listening'
-      ? `<button class="primary listen-button" data-listen>${state.mic === 'error' ? '重新開始收音' : '🎤 開始收音'}</button>`
-      : '';
-
     return `<section class="game-layout">
       <div class="stats"><span>Score <b>${state.score}</b></span><span>Combo <b>${state.combo}</b></span><span>${state.index + 1} / ${TOTAL}</span></div>
-      <div class="beat-card ${state.feedback.toLowerCase()}"><div class="pulse"></div><strong>${kana}</strong><p>${state.feedback || '唸出這個音'}</p>${state.heard ? `<small>聽到：${state.heard}</small>` : ''}</div>
-      <p class="mic-status">🎤 ${status()}</p>
-      ${listenButton}
+      <div class="beat-card ${state.feedback.toLowerCase()}"><div class="pulse"></div><strong>${kana}</strong><p>${state.feedback || '唸出這個音'}</p>${state.heard ? `<small>聽到：${escapeHtml(state.heard)}</small>` : ''}</div>
+      <p class="mic-status">🎤 ${escapeHtml(status())}</p>
       <div class="fallback-actions"><button data-correct>手動：正確</button><button data-wrong>手動：錯誤</button></div>
     </section>`;
   }
@@ -153,10 +154,12 @@ async function copyDebug() {
   const text = [
     `userAgent=${navigator.userAgent}`,
     `secureContext=${window.isSecureContext}`,
-    `SpeechRecognition=${Boolean(SpeechRecognitionCtor)}`,
-    `webkitSpeechRecognition=${Boolean(WebkitSpeechRecognitionCtor)}`,
+    `MediaRecorder=${Boolean(window.MediaRecorder)}`,
+    `AudioContext=${Boolean(window.AudioContext)}`,
+    `WebAssembly=${Boolean(window.WebAssembly)}`,
     `mediaDevices=${Boolean(navigator.mediaDevices)}`,
     `iOS=${isIOS}`,
+    `modelReady=${state.speechReady}`,
     ...state.logs,
   ].join('\n');
 
@@ -170,21 +173,27 @@ async function copyDebug() {
 }
 
 async function startGame() {
+  if (['requesting', 'loading-model'].includes(state.mic)) return;
   addLog('Start button tapped');
-  state.mic = Recognition ? 'requesting' : 'unsupported';
-  render();
 
-  if (Recognition && navigator.mediaDevices && navigator.mediaDevices.getUserMedia) {
+  if (localSpeechSupported) {
+    state.mic = 'requesting';
+    state.lastError = '';
+    render();
     try {
-      addLog('getUserMedia requested');
-      const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
-      addLog(`getUserMedia success; tracks=${stream.getAudioTracks().length}`);
-      stream.getTracks().forEach((track) => track.stop());
+      await recorder.requestPermission();
+      addLog('microphone permission granted');
+      state.mic = 'loading-model';
+      state.modelProgress = null;
+      render();
+      await speechEngine.initialize();
+      state.speechReady = true;
       state.mic = 'ready';
+      addLog('Whisper Tiny q8 ready');
     } catch (error) {
       state.mic = 'error';
-      state.lastError = `getUserMedia:${error.name || 'unknown'}`;
-      addLog(`getUserMedia error: ${error.name || error}`);
+      state.lastError = error.name || 'unknown';
+      addLog(`speech setup error: ${error.message || error}`);
     }
   }
 
@@ -207,100 +216,62 @@ async function startGame() {
 }
 
 function beginBeat() {
+  state.beatId += 1;
+  const beatId = state.beatId;
   addLog(`prompt ${state.index + 1} begin`);
   state.answered = false;
   state.feedback = '';
   state.heard = '';
   state.lastError = '';
   clearTimeout(state.timer);
-  stopRecognition();
 
-  if (!Recognition) {
-    state.mic = 'unsupported';
-  } else if (isIOS) {
-    state.mic = 'waiting';
-  } else {
-    state.mic = 'ready';
-    setTimeout(startRecognition, 0);
-  }
+  if (!localSpeechSupported) state.mic = 'unsupported';
+  else if (!state.speechReady) state.mic = 'error';
+  else state.mic = 'ready';
   render();
+
+  if (state.speechReady) void startRecording(beatId);
 }
 
-function startRecognition() {
-  addLog('listen button / startRecognition invoked');
-  if (!Recognition || state.answered) {
-    addLog(`start blocked; Recognition=${Boolean(Recognition)} answered=${state.answered}`);
-    render();
-    return;
-  }
-
-  stopRecognition();
-  clearTimeout(state.timer);
-  state.mic = 'listening';
-  state.lastError = '';
-  render();
-
-  let recognition;
+async function startRecording(beatId) {
   try {
-    recognition = new Recognition();
-    addLog('recognition object created');
-  } catch (error) {
-    state.mic = 'error';
-    state.lastError = `constructor:${error.name || 'unknown'}`;
-    addLog(`constructor error: ${error.name || error}`);
+    await recorder.start();
+    if (beatId !== state.beatId || state.answered) {
+      await recorder.cancel();
+      return;
+    }
+    state.mic = 'recording';
+    addLog('recording started');
     render();
-    return;
+    state.timer = setTimeout(() => void finishRecording(beatId), RECORDING_MS);
+  } catch (error) {
+    if (beatId !== state.beatId || state.answered) return;
+    state.mic = 'error';
+    state.lastError = `record:${error.name || 'unknown'}`;
+    addLog(`recording error: ${error.message || error}`);
+    render();
   }
+}
 
-  recognition.lang = 'ja-JP';
-  recognition.interimResults = false;
-  recognition.maxAlternatives = 5;
-  recognition.continuous = false;
-  recognition.onaudiostart = () => { addLog('event: audiostart'); render(); };
-  recognition.onsoundstart = () => { addLog('event: soundstart'); render(); };
-  recognition.onspeechstart = () => { addLog('event: speechstart'); render(); };
-  recognition.onspeechend = () => { addLog('event: speechend'); render(); };
-  recognition.onsoundend = () => { addLog('event: soundend'); render(); };
-  recognition.onaudioend = () => { addLog('event: audioend'); render(); };
-  recognition.onstart = () => { addLog('event: start'); render(); };
-  recognition.onresult = (event) => {
-    const alternatives = Array.from(event.results[0]).map((item) => item.transcript);
-    addLog(`event: result => ${alternatives.join(' | ')}`);
-    state.heard = alternatives[0] || '';
-    const accepted = state.round[state.index][1];
-    resolveBeat(alternatives.some((value) => accepted.includes(normalise(value))));
-  };
-  recognition.onerror = (event) => {
-    addLog(`event: error => ${event.error || 'unknown'}; message=${event.message || ''}`);
-    if (event.error !== 'aborted' && !state.answered) {
-      state.mic = 'error';
-      state.lastError = event.error || 'unknown';
-      clearTimeout(state.timer);
-      render();
-    }
-  };
-  recognition.onnomatch = () => { addLog('event: nomatch'); render(); };
-  recognition.onend = () => {
-    addLog('event: end');
-    if (!state.answered && state.mic === 'listening') {
-      state.mic = 'waiting';
-      clearTimeout(state.timer);
-    }
-    render();
-  };
-
-  state.recognition = recognition;
+async function finishRecording(beatId) {
   try {
-    addLog('calling recognition.start()');
-    recognition.start();
-    state.timer = setTimeout(() => {
-      addLog('recognition timeout');
-      if (!state.answered) resolveBeat(false);
-    }, BEAT_MS * 5);
+    const blob = await recorder.stop();
+    if (beatId !== state.beatId || state.answered) return;
+    addLog(`recording stopped; bytes=${blob.size}; type=${blob.type}`);
+    state.mic = 'transcribing';
+    render();
+
+    const text = await speechEngine.transcribe(blob);
+    if (beatId !== state.beatId || state.answered) return;
+    state.heard = text;
+    addLog(`local result => ${text || '(silence)'}`);
+    const expected = canonicalVowel(state.round[state.index][0]);
+    resolveBeat(canonicalVowel(text) === expected);
   } catch (error) {
+    if (beatId !== state.beatId || state.answered) return;
     state.mic = 'error';
-    state.lastError = `start:${error.name || 'unknown'}`;
-    addLog(`start exception: ${error.name || error}`);
+    state.lastError = `transcribe:${error.name || 'unknown'}`;
+    addLog(`transcription error: ${error.message || error}`);
     render();
   }
 }
@@ -309,9 +280,9 @@ function resolveBeat(ok) {
   if (state.answered) return;
   addLog(`resolveBeat(${ok})`);
   state.answered = true;
-  stopRecognition();
   clearTimeout(state.timer);
-  state.mic = Recognition ? 'ready' : 'unsupported';
+  void recorder.cancel();
+  state.mic = state.speechReady ? 'ready' : (localSpeechSupported ? 'error' : 'unsupported');
 
   if (ok) {
     state.correct += 1;
@@ -336,4 +307,5 @@ function resolveBeat(ok) {
   }, 450);
 }
 
+window.addEventListener('pagehide', () => void recorder.cancel());
 render();

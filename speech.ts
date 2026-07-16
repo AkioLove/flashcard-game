@@ -1,21 +1,22 @@
+import { Model, type KaldiRecognizer } from 'vosk-browser';
+
 export interface SpeechEngine {
   initialize(): Promise<void>;
   transcribe(audio: Blob): Promise<string>;
 }
 
 export type SpeechProgress = {
-  status: string;
-  file?: string;
+  status: 'downloading' | 'initializing' | 'ready';
   progress?: number;
-};
-
-type PendingRequest = {
-  resolve: (value: unknown) => void;
-  reject: (reason: Error) => void;
 };
 
 const TARGET_SAMPLE_RATE = 16_000;
 const MIN_RMS = 0.002;
+const MODEL_FILENAME = 'vosk-model-small-ja-0.22.tar.gz';
+const MODEL_URL = `${import.meta.env.BASE_URL}models/${MODEL_FILENAME}`;
+const MODEL_CACHE_KEY = 'kana-beat-vosk-ja-0.22-ready';
+const INITIALIZE_TIMEOUT_MS = 180_000;
+const TRANSCRIBE_TIMEOUT_MS = 20_000;
 
 function mixToMono(buffer: AudioBuffer): Float32Array {
   const mono = new Float32Array(buffer.length);
@@ -60,11 +61,9 @@ async function decodeAudio(blob: Blob): Promise<Float32Array> {
   }
 }
 
-class WhisperSpeechEngine implements SpeechEngine {
-  private worker: Worker | null = null;
+class VoskSpeechEngine implements SpeechEngine {
+  private model: Model | null = null;
   private initializePromise: Promise<void> | null = null;
-  private nextRequestId = 1;
-  private pending = new Map<number, PendingRequest>();
   private progressListener: ((progress: SpeechProgress) => void) | null = null;
 
   setProgressListener(listener: ((progress: SpeechProgress) => void) | null): void {
@@ -73,9 +72,10 @@ class WhisperSpeechEngine implements SpeechEngine {
 
   initialize(): Promise<void> {
     if (!this.initializePromise) {
-      this.initializePromise = this.request('initialize').then(() => undefined).catch((error) => {
+      this.initializePromise = this.initializeModel().catch((error) => {
+        this.model?.terminate();
+        this.model = null;
         this.initializePromise = null;
-        this.terminateWorker();
         throw error;
       });
     }
@@ -86,53 +86,124 @@ class WhisperSpeechEngine implements SpeechEngine {
     await this.initialize();
     const samples = await decodeAudio(audio);
     if (rootMeanSquare(samples) < MIN_RMS) return '';
+    if (!this.model?.ready) throw new Error('Vosk model is not ready.');
 
-    const result = await this.request('transcribe', { samples }, [samples.buffer]);
-    return String(result || '').trim();
+    const recognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE);
+    return this.recognize(recognizer, samples);
   }
 
-  private ensureWorker(): Worker {
-    if (this.worker) return this.worker;
+  private async initializeModel(): Promise<void> {
+    if (!this.isModelCacheKnown()) {
+      await this.prefetchModel();
+    }
 
-    const worker = new Worker(new URL('./speech.worker.ts', import.meta.url), { type: 'module' });
-    worker.addEventListener('message', (event) => {
-      const message = event.data;
-      if (message.type === 'progress') {
-        this.progressListener?.(message.progress);
-        return;
+    this.progressListener?.({ status: 'initializing' });
+    const model = new Model(MODEL_URL, -1);
+    this.model = model;
+
+    await new Promise<void>((resolve, reject) => {
+      const timeout = window.setTimeout(() => {
+        reject(new Error('Vosk initialization timed out after 180 seconds.'));
+      }, INITIALIZE_TIMEOUT_MS);
+
+      model.on('load', (message) => {
+        window.clearTimeout(timeout);
+        if (message.result) resolve();
+        else reject(new Error('Vosk could not load the Japanese model.'));
+      });
+      model.on('error', (message) => {
+        window.clearTimeout(timeout);
+        reject(new Error(message.error || 'Vosk worker failed.'));
+      });
+    });
+
+    this.markModelCacheReady();
+    this.progressListener?.({ status: 'ready', progress: 100 });
+  }
+
+  private isModelCacheKnown(): boolean {
+    try {
+      return localStorage.getItem(MODEL_CACHE_KEY) === 'true';
+    } catch {
+      return false;
+    }
+  }
+
+  private markModelCacheReady(): void {
+    try {
+      localStorage.setItem(MODEL_CACHE_KEY, 'true');
+    } catch {
+      // Safari privacy settings can disable persistent storage. The in-memory
+      // singleton still prevents reloads during the current page session.
+    }
+  }
+
+  private async prefetchModel(): Promise<void> {
+    this.progressListener?.({ status: 'downloading', progress: 0 });
+
+    try {
+      const response = await fetch(MODEL_URL, { cache: 'force-cache' });
+      if (!response.ok) throw new Error(`Model download failed: HTTP ${response.status}`);
+      if (!response.body) return;
+
+      const total = Number(response.headers.get('content-length')) || 0;
+      const reader = response.body.getReader();
+      let received = 0;
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        received += value.byteLength;
+        if (total > 0) {
+          this.progressListener?.({
+            status: 'downloading',
+            progress: Math.min(100, Math.floor(received / total * 100)),
+          });
+        }
       }
-
-      const pending = this.pending.get(message.requestId);
-      if (!pending) return;
-      this.pending.delete(message.requestId);
-      if (message.type === 'error') pending.reject(new Error(message.error));
-      else pending.resolve(message.result);
-    });
-    worker.addEventListener('error', (event) => {
-      const error = new Error(event.message || 'The local speech worker failed.');
-      for (const pending of this.pending.values()) pending.reject(error);
-      this.pending.clear();
-      this.initializePromise = null;
-      this.terminateWorker();
-    });
-    this.worker = worker;
-    return worker;
+    } catch {
+      // Vosk maintains its own persistent IndexedDB cache. If that cache exists,
+      // initialization can still succeed without a successful network preflight.
+    }
   }
 
-  private request(type: string, payload = {}, transfer: Transferable[] = []): Promise<unknown> {
-    const requestId = this.nextRequestId;
-    this.nextRequestId += 1;
-
+  private recognize(recognizer: KaldiRecognizer, samples: Float32Array): Promise<string> {
     return new Promise((resolve, reject) => {
-      this.pending.set(requestId, { resolve, reject });
-      this.ensureWorker().postMessage({ type, requestId, ...payload }, transfer);
-    });
-  }
+      const texts: string[] = [];
+      let waveformResponseReceived = false;
+      let settled = false;
 
-  private terminateWorker(): void {
-    this.worker?.terminate();
-    this.worker = null;
+      const finish = (error?: Error) => {
+        if (settled) return;
+        settled = true;
+        window.clearTimeout(timeout);
+        recognizer.remove();
+        if (error) reject(error);
+        else resolve(texts.join(' ').trim());
+      };
+
+      const timeout = window.setTimeout(() => {
+        finish(new Error('Local transcription timed out.'));
+      }, TRANSCRIBE_TIMEOUT_MS);
+
+      recognizer.on('partialresult', () => {
+        waveformResponseReceived = true;
+      });
+      recognizer.on('result', (message) => {
+        const text = 'text' in message.result ? message.result.text.trim() : '';
+        if (text) texts.push(text);
+
+        if (waveformResponseReceived) finish();
+        else waveformResponseReceived = true;
+      });
+      recognizer.on('error', (message) => {
+        finish(new Error(message.error || 'Vosk recognizer failed.'));
+      });
+
+      recognizer.acceptWaveformFloat(samples, TARGET_SAMPLE_RATE);
+      recognizer.retrieveFinalResult();
+    });
   }
 }
 
-export const speechEngine = new WhisperSpeechEngine();
+export const speechEngine = new VoskSpeechEngine();

@@ -15,7 +15,7 @@ No local setup is required.
 - Vowels only: あ・い・う・え・お
 - Fixed 80 BPM rhythm
 - 20 prompts per round
-- Local Japanese speech recognition with quantized Whisper Tiny and Transformers.js
+- Local Japanese speech recognition with Vosk WASM
 - Correct / wrong feedback
 - Score, combo, accuracy, and final results
 - Manual fallback buttons when speech recognition is unavailable
@@ -23,9 +23,10 @@ No local setup is required.
 ## Local speech engine
 
 - Audio is captured for 1.5 seconds with `MediaRecorder` and decoded to 16 kHz mono PCM.
-- `onnx-community/whisper-tiny` runs locally in a Web Worker through the WASM backend at q8 precision.
-- The model is initialized once per page and browser caching avoids downloading unchanged model files again.
+- `vosk-model-small-ja-0.22` runs locally inside Vosk's Web Worker and supports general Japanese rather than only the current five vowels.
+- The model is initialized once per page. Vosk stores it in IndexedDB so later rounds and visits do not reload it.
 - No recording or transcript is sent to a backend or cloud speech API.
+- `npm run build` downloads the official Apache-2.0 model, verifies its SHA-256 checksum, and packages it for same-origin GitHub Pages delivery. The generated model archive is not committed to Git.
 
 ## iPhone Safari
 
@@ -42,3 +43,5 @@ npm run dev
 ```
 
 Microphone access requires HTTPS or `localhost`.
+
+Run `npm run build` once before local device testing so `public/models` contains the Vosk archive.

@@ -35,6 +35,7 @@ let state = {
   answered: false,
   speechReady: false,
   modelProgress: null,
+  modelStatus: null,
   beatId: 0,
   lastError: '',
   logs: [],
@@ -54,9 +55,14 @@ addLog(`iOS=${isIOS}`);
 
 speechEngine.setProgressListener((progress) => {
   if (state.mic !== 'loading-model') return;
+  const statusChanged = state.modelStatus !== progress.status;
+  state.modelStatus = progress.status;
   const next = Number.isFinite(progress.progress) ? Math.floor(progress.progress) : null;
-  if (next !== null && next !== state.modelProgress) {
+  const progressChanged = next !== null && next !== state.modelProgress;
+  if (progressChanged) {
     state.modelProgress = next;
+  }
+  if (statusChanged || progressChanged) {
     render();
   }
 });
@@ -71,7 +77,9 @@ function status() {
   return ({
     unsupported: '此瀏覽器沒有可用的本機語音辨識。',
     requesting: '正在請求麥克風權限…',
-    'loading-model': `正在下載並載入本機語音模型${state.modelProgress === null ? '…' : `（${state.modelProgress}%）`}`,
+    'loading-model': state.modelStatus === 'initializing'
+      ? '模型下載完成，正在初始化 Vosk 辨識核心…'
+      : `正在下載日文語音模型${state.modelProgress === null ? '…' : `（${state.modelProgress}%）`}`,
     recording: '正在錄音，請現在唸出畫面上的假名',
     transcribing: '正在手機內辨識語音…',
     error: `本機語音辨識失敗${state.lastError ? `（${state.lastError}）` : ''}。`,
@@ -88,6 +96,7 @@ function debugPanel() {
     ['mediaDevices', Boolean(navigator.mediaDevices)],
     ['iPhone / iPad', isIOS],
     ['Model ready', state.speechReady],
+    ['Model stage', state.modelStatus || 'idle'],
     ['Mic state', state.mic],
   ];
 
@@ -185,14 +194,15 @@ async function startGame() {
       addLog('microphone permission granted');
       state.mic = 'loading-model';
       state.modelProgress = null;
+      state.modelStatus = 'downloading';
       render();
       await speechEngine.initialize();
       state.speechReady = true;
       state.mic = 'ready';
-      addLog('Whisper Tiny q8 ready');
+      addLog('Vosk Japanese small model ready');
     } catch (error) {
       state.mic = 'error';
-      state.lastError = error.name || 'unknown';
+      state.lastError = error.message || error.name || 'unknown';
       addLog(`speech setup error: ${error.message || error}`);
     }
   }

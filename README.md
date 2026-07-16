@@ -25,7 +25,7 @@ No local setup, speech model download, backend, or API key is required.
 - Kana Beat uses `SpeechRecognition` or the prefixed `webkitSpeechRecognition` implementation exposed by the browser.
 - Recognition is configured for `ja-JP`, up to ten alternatives, interim results, and contextual vocabulary hints where the browser supports them.
 - The green **現在唸！** cue appears only after the browser fires `audiostart`, so it reflects the actual listening window rather than a fixed recording timer.
-- Each prompt uses a fresh recognition session. The game accepts the highest-ranked alternative that normalizes to a supported kana.
+- Each prompt uses a fresh recognition session. The game checks the first three alternatives and accepts safe recognition variants such as repeated vowels, trailing small kana, and common single-vowel homophones.
 - This is a frontend-only integration with no application server and no API key. The browser vendor may still process speech on its servers, so it is not guaranteed to be offline or device-local.
 
 ## Browser notes

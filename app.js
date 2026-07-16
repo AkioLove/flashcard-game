@@ -1,5 +1,5 @@
 import { canRecognizeSpeech, recognitionImplementation, speechEngine } from './speech.ts';
-import { canonicalVowel } from './kana-normalize.js';
+import { canonicalVowel, matchVowelCandidates, recognitionVowel } from './kana-normalize.js';
 
 const KANA = [
   ['あ', ['あ', 'ア', 'a']],
@@ -232,11 +232,12 @@ async function recognizeBeat(beatId) {
     state.mic = 'transcribing';
 
     const ranked = result.alternatives;
-    const selected = ranked.find((alternative) => canonicalVowel(alternative.transcript))
+    const expected = canonicalVowel(state.round[state.index][0]);
+    const decision = matchVowelCandidates(expected, ranked);
+    const selected = decision.candidate
+      || ranked.find((alternative) => recognitionVowel(alternative.transcript))
       || ranked[0]
       || { transcript: result.transcript, confidence: null, final: false, rank: 0 };
-    const expected = canonicalVowel(state.round[state.index][0]);
-    const heard = canonicalVowel(selected.transcript);
     state.heard = selected.transcript;
 
     const candidates = ranked.map((alternative) => {
@@ -244,7 +245,8 @@ async function recognizeBeat(beatId) {
       return `${alternative.transcript} (${confidence}${alternative.final ? ', final' : ', interim'})`;
     }).join(' | ');
     addLog(`result ${Math.round(performance.now() - requestedAt)}ms => ${candidates || '(silence)'}`);
-    resolveBeat(Boolean(heard && heard === expected));
+    addLog(`decision expected=${expected}; matched=${decision.matched}; candidateRank=${decision.rank === null ? 'n/a' : decision.rank + 1}; mode=${decision.mode}`);
+    resolveBeat(decision.matched);
   } catch (error) {
     if (beatId !== state.beatId || state.answered) return;
     state.mic = 'error';

@@ -106,11 +106,24 @@ class VoskSpeechEngine implements SpeechEngine {
     if (!this.model?.ready) throw new Error('Vosk model is not ready.');
 
     const grammar = this.vocabulary.length
-      ? JSON.stringify(['[unk]', ...this.vocabulary])
+      ? JSON.stringify(this.vocabulary)
       : undefined;
-    const recognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE, grammar);
-    recognizer.setWords(true);
-    return this.recognize(recognizer, samples);
+    if (grammar) {
+      try {
+        const recognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE, grammar);
+        recognizer.setWords(true);
+        const constrainedResult = await this.recognize(recognizer, samples);
+        if (constrainedResult) return constrainedResult;
+        this.diagnosticListener?.('Vosk constrained result empty; retrying without grammar');
+      } catch (error) {
+        const message = error instanceof Error ? error.message : String(error);
+        this.diagnosticListener?.(`Vosk constrained recognizer failed (${message}); retrying without grammar`);
+      }
+    }
+
+    const fallbackRecognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE);
+    fallbackRecognizer.setWords(true);
+    return this.recognize(fallbackRecognizer, samples);
   }
 
   private async initializeModel(): Promise<void> {
@@ -191,6 +204,7 @@ class VoskSpeechEngine implements SpeechEngine {
   private recognize(recognizer: KaldiRecognizer, samples: Float32Array): Promise<string> {
     return new Promise((resolve, reject) => {
       const texts: string[] = [];
+      const rawTexts: string[] = [];
       let bestWord = '';
       let bestConfidence = -1;
       let waveformResponseReceived = false;
@@ -204,7 +218,7 @@ class VoskSpeechEngine implements SpeechEngine {
         if (error) reject(error);
         else {
           const selected = bestWord || texts.join(' ').trim();
-          this.diagnosticListener?.(`Vosk selected=${selected || '(silence)'}; confidence=${bestConfidence < 0 ? 'n/a' : bestConfidence.toFixed(3)}`);
+          this.diagnosticListener?.(`Vosk raw=${rawTexts.join(' | ') || '(empty)'}; selected=${selected || '(silence)'}; confidence=${bestConfidence < 0 ? 'n/a' : bestConfidence.toFixed(3)}`);
           resolve(selected);
         }
       };
@@ -218,6 +232,7 @@ class VoskSpeechEngine implements SpeechEngine {
       });
       recognizer.on('result', (message) => {
         const text = 'text' in message.result ? message.result.text.trim() : '';
+        if (text) rawTexts.push(text);
         if (text && text !== '[unk]') texts.push(text);
 
         const words = 'result' in message.result && Array.isArray(message.result.result)

@@ -14,6 +14,7 @@ const TOTAL = 20;
 const BPM = 80;
 const BEAT_MS = Math.round(60000 / BPM);
 const Recognition = window.SpeechRecognition || window.webkitSpeechRecognition;
+const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent);
 
 function makeRound() {
   return Array.from({ length: TOTAL }, () => KANA[Math.floor(Math.random() * KANA.length)]);
@@ -40,9 +41,11 @@ function App() {
   const beatTimerRef = useRef(null);
 
   const current = round[index];
-  const accuracy = index ? Math.round((correct / index) * 100) : 0;
 
-  useEffect(() => () => clearTimeout(beatTimerRef.current), []);
+  useEffect(() => () => {
+    clearTimeout(beatTimerRef.current);
+    stopRecognition();
+  }, []);
 
   useEffect(() => {
     if (phase !== 'countdown') return;
@@ -61,7 +64,7 @@ function App() {
   }, [phase, index]);
 
   function stopRecognition() {
-    try { recognitionRef.current?.stop(); } catch {}
+    try { recognitionRef.current?.abort(); } catch {}
     recognitionRef.current = null;
   }
 
@@ -84,7 +87,9 @@ function App() {
         const matched = alternatives.some((value) => current.accepted.includes(normalise(value)));
         resolveBeat(matched);
       };
-      recognition.onerror = () => setMicState('error');
+      recognition.onerror = (event) => {
+        if (event.error !== 'aborted') setMicState('error');
+      };
       recognition.onend = () => {
         if (!answeredRef.current) setMicState('waiting');
       };
@@ -102,7 +107,7 @@ function App() {
     answeredRef.current = true;
     stopRecognition();
     clearTimeout(beatTimerRef.current);
-    setMicState('ready');
+    setMicState(Recognition ? 'ready' : 'unsupported');
 
     if (isCorrect) {
       const nextCombo = combo + 1;
@@ -122,7 +127,19 @@ function App() {
     }, 450);
   }
 
-  function startGame() {
+  async function startGame() {
+    setMicState(Recognition ? 'requesting' : 'unsupported');
+
+    if (Recognition && navigator.mediaDevices?.getUserMedia) {
+      try {
+        const stream = await navigator.mediaDevices.getUserMedia({ audio: true });
+        stream.getTracks().forEach((track) => track.stop());
+        setMicState('ready');
+      } catch {
+        setMicState('error');
+      }
+    }
+
     setCountdown(3);
     setPhase('countdown');
   }
@@ -132,9 +149,12 @@ function App() {
   }
 
   const statusText = useMemo(() => {
-    if (micState === 'unsupported') return '此瀏覽器不支援語音辨識，可用下方按鈕測試流程。';
+    if (micState === 'unsupported') return '此瀏覽器沒有可用的語音辨識，仍可用下方按鈕測試遊戲。';
+    if (micState === 'requesting') return '正在請求麥克風權限…';
     if (micState === 'listening') return '正在聽，請唸出畫面上的假名';
+    if (micState === 'waiting') return '沒有收到語音，請再唸一次或使用手動判定。';
     if (micState === 'error') return '麥克風或語音辨識失敗，可用手動判定。';
+    if (isIOS) return 'iPhone Safari：按開始後請允許麥克風。';
     return '準備好麥克風後開始';
   }, [micState]);
 
@@ -149,7 +169,9 @@ function App() {
         <section className="panel intro">
           <h2>看到假名，立刻唸出來</h2>
           <p>本局 20 題，只練習 あ・い・う・え・お。</p>
-          <button className="primary" onClick={startGame}>開始</button>
+          <button className="primary" onClick={startGame} disabled={micState === 'requesting'}>
+            {micState === 'requesting' ? '啟用麥克風中…' : '開始'}
+          </button>
           <small>{statusText}</small>
         </section>
       )}

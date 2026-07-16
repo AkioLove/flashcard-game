@@ -2,4 +2,3 @@ dist/
 node_modules/
 *.log
 .cache/
-public/models/*.tar.gz

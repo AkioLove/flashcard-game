@@ -1,95 +1,86 @@
-import { Model, type KaldiRecognizer } from 'vosk-browser';
-
 export interface SpeechEngine {
   initialize(): Promise<void>;
   setVocabulary(terms: readonly string[]): void;
-  transcribe(audio: Blob): Promise<string>;
+  recognize(): Promise<SpeechResult>;
+  abort(): void;
 }
 
-export type SpeechProgress = {
-  status: 'downloading' | 'initializing' | 'ready';
-  progress?: number;
+export type SpeechAlternative = {
+  transcript: string;
+  confidence: number | null;
+  final: boolean;
+  rank: number;
 };
 
-const TARGET_SAMPLE_RATE = 16_000;
-const MIN_RMS = 0.002;
-const MODEL_FILENAME = 'vosk-model-small-ja-0.22.tar.gz';
-const MODEL_URL = `${import.meta.env.BASE_URL}models/${MODEL_FILENAME}`;
-const MODEL_CACHE_KEY = 'kana-beat-vosk-ja-0.22-ready';
-const INITIALIZE_TIMEOUT_MS = 180_000;
-const TRANSCRIBE_TIMEOUT_MS = 20_000;
+export type SpeechResult = {
+  transcript: string;
+  alternatives: SpeechAlternative[];
+};
 
-function mixToMono(buffer: AudioBuffer): Float32Array {
-  const mono = new Float32Array(buffer.length);
-  for (let channel = 0; channel < buffer.numberOfChannels; channel += 1) {
-    const data = buffer.getChannelData(channel);
-    for (let i = 0; i < data.length; i += 1) mono[i] += data[i] / buffer.numberOfChannels;
-  }
-  return mono;
+export type SpeechEngineEvent = {
+  type: string;
+  phase: 'initialize' | 'recognize';
+  detail?: string;
+};
+
+type Recognition = any;
+
+const INITIALIZE_TIMEOUT_MS = 20_000;
+const AUDIO_WINDOW_MS = 3_500;
+const RESULT_GRACE_MS = 1_200;
+const RECOGNITION_TIMEOUT_MS = 9_000;
+
+function recognitionConstructor(): any {
+  const browserWindow = window as any;
+  return browserWindow.SpeechRecognition || browserWindow.webkitSpeechRecognition || null;
 }
 
-function resample(input: Float32Array, sourceRate: number): Float32Array {
-  if (sourceRate === TARGET_SAMPLE_RATE) return input;
-
-  const outputLength = Math.max(1, Math.round(input.length * TARGET_SAMPLE_RATE / sourceRate));
-  const output = new Float32Array(outputLength);
-  const ratio = sourceRate / TARGET_SAMPLE_RATE;
-
-  for (let i = 0; i < outputLength; i += 1) {
-    const position = i * ratio;
-    const left = Math.floor(position);
-    const right = Math.min(left + 1, input.length - 1);
-    const fraction = position - left;
-    output[i] = input[left] * (1 - fraction) + input[right] * fraction;
-  }
-  return output;
+function emptyResult(): SpeechResult {
+  return { transcript: '', alternatives: [] };
 }
 
-function rootMeanSquare(samples: Float32Array): number {
-  let energy = 0;
-  for (const sample of samples) energy += sample * sample;
-  return Math.sqrt(energy / Math.max(1, samples.length));
+function errorMessage(event: any): string {
+  return [event?.error, event?.message].filter(Boolean).join(': ') || 'unknown speech recognition error';
 }
 
-async function decodeAudio(blob: Blob): Promise<Float32Array> {
-  const context = new AudioContext();
-  try {
-    const encoded = await blob.arrayBuffer();
-    const buffer = await context.decodeAudioData(encoded.slice(0));
-    return resample(mixToMono(buffer), buffer.sampleRate);
-  } finally {
-    await context.close().catch(() => undefined);
-  }
+export function canRecognizeSpeech(): boolean {
+  return Boolean(window.isSecureContext && recognitionConstructor());
 }
 
-class VoskSpeechEngine implements SpeechEngine {
-  private model: Model | null = null;
+export function recognitionImplementation(): string {
+  const browserWindow = window as any;
+  if (browserWindow.SpeechRecognition) return 'SpeechRecognition';
+  if (browserWindow.webkitSpeechRecognition) return 'webkitSpeechRecognition';
+  return 'unavailable';
+}
+
+class BrowserSpeechEngine implements SpeechEngine {
   private initializePromise: Promise<void> | null = null;
-  private progressListener: ((progress: SpeechProgress) => void) | null = null;
-  private diagnosticListener: ((message: string) => void) | null = null;
   private vocabulary: string[] = [];
+  private eventListener: ((event: SpeechEngineEvent) => void) | null = null;
+  private active: { abort: () => void } | null = null;
 
-  setProgressListener(listener: ((progress: SpeechProgress) => void) | null): void {
-    this.progressListener = listener;
-  }
-
-  setDiagnosticListener(listener: ((message: string) => void) | null): void {
-    this.diagnosticListener = listener;
+  setEventListener(listener: ((event: SpeechEngineEvent) => void) | null): void {
+    this.eventListener = listener;
   }
 
   setVocabulary(terms: readonly string[]): void {
     this.vocabulary = [...new Set(
       terms
         .map((term) => String(term).normalize('NFKC').trim())
-        .filter((term) => term && term !== '[unk]'),
+        .filter(Boolean),
     )];
   }
 
   initialize(): Promise<void> {
+    if (!canRecognizeSpeech()) {
+      return Promise.reject(new Error('Web Speech API is unavailable in this browser.'));
+    }
+
     if (!this.initializePromise) {
-      this.initializePromise = this.initializeModel().catch((error) => {
-        this.model?.terminate();
-        this.model = null;
+      // This probe starts synchronously inside the Start-button gesture. That is
+      // important on iOS, where microphone permission may require user activation.
+      this.initializePromise = this.probeMicrophone().catch((error) => {
         this.initializePromise = null;
         throw error;
       });
@@ -97,165 +88,241 @@ class VoskSpeechEngine implements SpeechEngine {
     return this.initializePromise;
   }
 
-  async transcribe(audio: Blob): Promise<string> {
-    await this.initialize();
-    const samples = await decodeAudio(audio);
-    const rms = rootMeanSquare(samples);
-    this.diagnosticListener?.(`audio rms=${rms.toFixed(4)}; duration=${(samples.length / TARGET_SAMPLE_RATE).toFixed(2)}s`);
-    if (rms < MIN_RMS) return '';
-    if (!this.model?.ready) throw new Error('Vosk model is not ready.');
-
-    const grammar = this.vocabulary.length
-      ? JSON.stringify(this.vocabulary)
-      : undefined;
-    if (grammar) {
-      try {
-        const recognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE, grammar);
-        recognizer.setWords(true);
-        const constrainedResult = await this.recognize(recognizer, samples);
-        if (constrainedResult) return constrainedResult;
-        this.diagnosticListener?.('Vosk constrained result empty; retrying without grammar');
-      } catch (error) {
-        const message = error instanceof Error ? error.message : String(error);
-        this.diagnosticListener?.(`Vosk constrained recognizer failed (${message}); retrying without grammar`);
-      }
+  recognize(): Promise<SpeechResult> {
+    if (!canRecognizeSpeech()) {
+      return Promise.reject(new Error('Web Speech API is unavailable in this browser.'));
     }
 
-    const fallbackRecognizer = new this.model.KaldiRecognizer(TARGET_SAMPLE_RATE);
-    fallbackRecognizer.setWords(true);
-    return this.recognize(fallbackRecognizer, samples);
-  }
+    this.abort();
+    const recognition = this.createRecognition();
+    const resultGroups = new Map<number, SpeechAlternative[]>();
 
-  private async initializeModel(): Promise<void> {
-    if (!this.isModelCacheKnown()) {
-      await this.prefetchModel();
-    }
-
-    this.progressListener?.({ status: 'initializing' });
-    const model = new Model(MODEL_URL, -1);
-    this.model = model;
-
-    await new Promise<void>((resolve, reject) => {
-      const timeout = window.setTimeout(() => {
-        reject(new Error('Vosk initialization timed out after 180 seconds.'));
-      }, INITIALIZE_TIMEOUT_MS);
-
-      model.on('load', (message) => {
-        window.clearTimeout(timeout);
-        if (message.result) resolve();
-        else reject(new Error('Vosk could not load the Japanese model.'));
-      });
-      model.on('error', (message) => {
-        window.clearTimeout(timeout);
-        reject(new Error(message.error || 'Vosk worker failed.'));
-      });
-    });
-
-    this.markModelCacheReady();
-    this.progressListener?.({ status: 'ready', progress: 100 });
-  }
-
-  private isModelCacheKnown(): boolean {
-    try {
-      return localStorage.getItem(MODEL_CACHE_KEY) === 'true';
-    } catch {
-      return false;
-    }
-  }
-
-  private markModelCacheReady(): void {
-    try {
-      localStorage.setItem(MODEL_CACHE_KEY, 'true');
-    } catch {
-      // Safari privacy settings can disable persistent storage. The in-memory
-      // singleton still prevents reloads during the current page session.
-    }
-  }
-
-  private async prefetchModel(): Promise<void> {
-    this.progressListener?.({ status: 'downloading', progress: 0 });
-
-    try {
-      const response = await fetch(MODEL_URL, { cache: 'force-cache' });
-      if (!response.ok) throw new Error(`Model download failed: HTTP ${response.status}`);
-      if (!response.body) return;
-
-      const total = Number(response.headers.get('content-length')) || 0;
-      const reader = response.body.getReader();
-      let received = 0;
-
-      while (true) {
-        const { done, value } = await reader.read();
-        if (done) break;
-        received += value.byteLength;
-        if (total > 0) {
-          this.progressListener?.({
-            status: 'downloading',
-            progress: Math.min(100, Math.floor(received / total * 100)),
-          });
-        }
-      }
-    } catch {
-      // Vosk maintains its own persistent IndexedDB cache. If that cache exists,
-      // initialization can still succeed without a successful network preflight.
-    }
-  }
-
-  private recognize(recognizer: KaldiRecognizer, samples: Float32Array): Promise<string> {
     return new Promise((resolve, reject) => {
-      const texts: string[] = [];
-      const rawTexts: string[] = [];
-      let bestWord = '';
-      let bestConfidence = -1;
-      let waveformResponseReceived = false;
       let settled = false;
+      let audioTimer = 0;
+      let resultTimer = 0;
+
+      const clearTimers = () => {
+        window.clearTimeout(audioTimer);
+        window.clearTimeout(resultTimer);
+        window.clearTimeout(timeout);
+      };
+
+      const buildResult = (): SpeechResult => {
+        const all = [...resultGroups.entries()]
+          .sort(([left], [right]) => left - right)
+          .flatMap(([, alternatives]) => alternatives);
+        const final = all.filter((alternative) => alternative.final);
+        const source = final.length ? final : all;
+        const unique = new Map<string, SpeechAlternative>();
+
+        for (const alternative of source) {
+          const key = alternative.transcript.normalize('NFKC').trim();
+          if (!key) continue;
+          const previous = unique.get(key);
+          if (!previous || alternative.rank < previous.rank) unique.set(key, alternative);
+        }
+
+        const alternatives = [...unique.values()];
+        return {
+          transcript: alternatives[0]?.transcript || '',
+          alternatives,
+        };
+      };
+
+      const finish = (result: SpeechResult, error?: Error, shouldAbort = false) => {
+        if (settled) return;
+        settled = true;
+        clearTimers();
+        if (this.active?.abort === abort) this.active = null;
+        if (shouldAbort) {
+          try {
+            recognition.abort();
+          } catch {
+            // The browser may already have closed this recognition session.
+          }
+        }
+        if (error) reject(error);
+        else resolve(result);
+      };
+
+      const stopForResult = () => {
+        if (settled) return;
+        this.emit('stop', 'recognize');
+        try {
+          recognition.stop();
+        } catch {
+          finish(buildResult(), undefined, true);
+          return;
+        }
+        window.clearTimeout(resultTimer);
+        resultTimer = window.setTimeout(() => finish(buildResult(), undefined, true), RESULT_GRACE_MS);
+      };
+
+      const abort = () => finish(emptyResult(), undefined, true);
+      this.active = { abort };
+
+      const timeout = window.setTimeout(() => {
+        this.emit('timeout', 'recognize');
+        finish(buildResult(), undefined, true);
+      }, RECOGNITION_TIMEOUT_MS);
+
+      recognition.onstart = () => this.emit('start', 'recognize');
+      recognition.onaudiostart = () => {
+        this.emit('audiostart', 'recognize');
+        window.clearTimeout(audioTimer);
+        audioTimer = window.setTimeout(stopForResult, AUDIO_WINDOW_MS);
+      };
+      recognition.onsoundstart = () => this.emit('soundstart', 'recognize');
+      recognition.onspeechstart = () => this.emit('speechstart', 'recognize');
+      recognition.onspeechend = () => {
+        this.emit('speechend', 'recognize');
+        window.clearTimeout(resultTimer);
+        resultTimer = window.setTimeout(stopForResult, 250);
+      };
+      recognition.onsoundend = () => this.emit('soundend', 'recognize');
+      recognition.onaudioend = () => this.emit('audioend', 'recognize');
+      recognition.onnomatch = () => this.emit('nomatch', 'recognize');
+      recognition.onresult = (event: any) => {
+        let hasFinal = false;
+        for (let index = event.resultIndex; index < event.results.length; index += 1) {
+          const result = event.results[index];
+          const alternatives: SpeechAlternative[] = [];
+          for (let rank = 0; rank < result.length; rank += 1) {
+            const candidate = result[rank];
+            const transcript = String(candidate.transcript || '').trim();
+            if (!transcript) continue;
+            alternatives.push({
+              transcript,
+              confidence: Number.isFinite(candidate.confidence) ? candidate.confidence : null,
+              final: Boolean(result.isFinal),
+              rank,
+            });
+          }
+          resultGroups.set(index, alternatives);
+          hasFinal ||= Boolean(result.isFinal);
+        }
+
+        const current = buildResult();
+        this.emit('result', 'recognize', current.alternatives.map((item) => item.transcript).join(' | ') || '(empty)');
+        if (hasFinal) finish(current, undefined, true);
+      };
+      recognition.onerror = (event: any) => {
+        if (settled) return;
+        const message = errorMessage(event);
+        this.emit('error', 'recognize', message);
+
+        if (event?.error === 'no-speech' || event?.error === 'aborted') {
+          finish(buildResult());
+          return;
+        }
+        finish(buildResult(), new Error(message), true);
+      };
+      recognition.onend = () => {
+        this.emit('end', 'recognize');
+        finish(buildResult());
+      };
+
+      try {
+        recognition.start();
+      } catch (error) {
+        finish(emptyResult(), error instanceof Error ? error : new Error(String(error)), true);
+      }
+    });
+  }
+
+  abort(): void {
+    const active = this.active;
+    this.active = null;
+    active?.abort();
+  }
+
+  private probeMicrophone(): Promise<void> {
+    const recognition = this.createRecognition();
+
+    return new Promise((resolve, reject) => {
+      let settled = false;
+      let started = false;
 
       const finish = (error?: Error) => {
         if (settled) return;
         settled = true;
         window.clearTimeout(timeout);
-        recognizer.remove();
-        if (error) reject(error);
-        else {
-          const selected = bestWord || texts.join(' ').trim();
-          this.diagnosticListener?.(`Vosk raw=${rawTexts.join(' | ') || '(empty)'}; selected=${selected || '(silence)'}; confidence=${bestConfidence < 0 ? 'n/a' : bestConfidence.toFixed(3)}`);
-          resolve(selected);
+        try {
+          recognition.abort();
+        } catch {
+          // The probe may already have ended.
         }
+        if (error) reject(error);
+        else resolve();
       };
 
       const timeout = window.setTimeout(() => {
-        finish(new Error('Local transcription timed out.'));
-      }, TRANSCRIBE_TIMEOUT_MS);
+        if (started) finish();
+        else finish(new Error('Web Speech API did not start within 20 seconds.'));
+      }, INITIALIZE_TIMEOUT_MS);
 
-      recognizer.on('partialresult', () => {
-        waveformResponseReceived = true;
-      });
-      recognizer.on('result', (message) => {
-        const text = 'text' in message.result ? message.result.text.trim() : '';
-        if (text) rawTexts.push(text);
-        if (text && text !== '[unk]') texts.push(text);
+      recognition.onstart = () => {
+        started = true;
+        this.emit('start', 'initialize');
+      };
+      recognition.onaudiostart = () => {
+        this.emit('audiostart', 'initialize');
+        finish();
+      };
+      recognition.onerror = (event: any) => {
+        if (settled) return;
+        const message = errorMessage(event);
+        this.emit('error', 'initialize', message);
+        if (event?.error === 'aborted' && started) finish();
+        else finish(new Error(message));
+      };
+      recognition.onend = () => {
+        if (settled) return;
+        this.emit('end', 'initialize');
+        if (started) finish();
+        else finish(new Error('Web Speech API ended before it could start.'));
+      };
 
-        const words = 'result' in message.result && Array.isArray(message.result.result)
-          ? message.result.result
-          : [];
-        for (const word of words) {
-          if (word.word !== '[unk]' && word.conf > bestConfidence) {
-            bestWord = word.word;
-            bestConfidence = word.conf;
-          }
-        }
-
-        if (waveformResponseReceived) finish();
-        else waveformResponseReceived = true;
-      });
-      recognizer.on('error', (message) => {
-        finish(new Error(message.error || 'Vosk recognizer failed.'));
-      });
-
-      recognizer.acceptWaveformFloat(samples, TARGET_SAMPLE_RATE);
-      recognizer.retrieveFinalResult();
+      try {
+        recognition.start();
+      } catch (error) {
+        finish(error instanceof Error ? error : new Error(String(error)));
+      }
     });
+  }
+
+  private createRecognition(): Recognition {
+    const Constructor = recognitionConstructor();
+    const recognition = new Constructor();
+    recognition.lang = 'ja-JP';
+    recognition.continuous = false;
+    recognition.interimResults = true;
+    recognition.maxAlternatives = 10;
+
+    if ('processLocally' in recognition) {
+      try {
+        recognition.processLocally = false;
+      } catch {
+        // This experimental option is read-only in some implementations.
+      }
+    }
+
+    const Phrase = (window as any).SpeechRecognitionPhrase;
+    if (Phrase && 'phrases' in recognition && this.vocabulary.length) {
+      try {
+        recognition.phrases = this.vocabulary.map((term) => new Phrase(term, 10));
+      } catch {
+        // Contextual biasing is experimental; recognition still works without it.
+      }
+    }
+
+    return recognition;
+  }
+
+  private emit(type: string, phase: SpeechEngineEvent['phase'], detail?: string): void {
+    this.eventListener?.({ type, phase, detail });
   }
 }
 
-export const speechEngine = new VoskSpeechEngine();
+export const speechEngine = new BrowserSpeechEngine();

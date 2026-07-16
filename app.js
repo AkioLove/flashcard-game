@@ -1,5 +1,4 @@
-import { AudioRecorder, canRecordAudio } from './recorder.ts';
-import { speechEngine } from './speech.ts';
+import { canRecognizeSpeech, recognitionImplementation, speechEngine } from './speech.ts';
 import { canonicalVowel } from './kana-normalize.js';
 
 const KANA = [
@@ -12,14 +11,11 @@ const KANA = [
 
 const TOTAL = 20;
 const BPM = 80;
-const BEAT_MS = Math.round(60000 / BPM);
-const RECORDING_MS = Math.max(1800, BEAT_MS * 2);
 const isIOS = /iPad|iPhone|iPod/.test(navigator.userAgent)
   || (navigator.platform === 'MacIntel' && navigator.maxTouchPoints > 1);
-const localSpeechSupported = Boolean(canRecordAudio() && window.Worker && window.WebAssembly);
+const speechSupported = canRecognizeSpeech();
 const app = document.querySelector('#root');
-const recorder = new AudioRecorder();
-const speechVocabulary = [...new Set(KANA.map(([kana]) => kana))];
+const speechVocabulary = [...new Set(KANA.flatMap(([, aliases]) => aliases))];
 speechEngine.setVocabulary(speechVocabulary);
 
 let state = {
@@ -32,12 +28,9 @@ let state = {
   correct: 0,
   feedback: '',
   heard: '',
-  mic: localSpeechSupported ? 'ready' : 'unsupported',
-  timer: null,
+  mic: speechSupported ? 'ready' : 'unsupported',
   answered: false,
   speechReady: false,
-  modelProgress: null,
-  modelStatus: null,
   beatId: 0,
   lastError: '',
   logs: [],
@@ -46,28 +39,20 @@ let state = {
 function addLog(message) {
   const time = new Date().toLocaleTimeString('zh-TW', { hour12: false });
   state.logs.push(`${time}  ${message}`);
-  state.logs = state.logs.slice(-16);
+  state.logs = state.logs.slice(-24);
 }
 
 addLog(`page loaded; secureContext=${window.isSecureContext}`);
-addLog(`MediaRecorder=${Boolean(window.MediaRecorder)}`);
-addLog(`AudioContext=${Boolean(window.AudioContext)}`);
-addLog(`WebAssembly=${Boolean(window.WebAssembly)}`);
+addLog(`SpeechRecognition=${speechSupported}; implementation=${recognitionImplementation()}`);
 addLog(`iOS=${isIOS}`);
-speechEngine.setDiagnosticListener((message) => addLog(message));
 
-speechEngine.setProgressListener((progress) => {
-  if (state.mic !== 'loading-model') return;
-  const statusChanged = state.modelStatus !== progress.status;
-  state.modelStatus = progress.status;
-  const next = Number.isFinite(progress.progress) ? Math.floor(progress.progress) : null;
-  const progressChanged = next !== null && next !== state.modelProgress;
-  if (progressChanged) {
-    state.modelProgress = next;
-  }
-  if (statusChanged || progressChanged) {
-    render();
-  }
+speechEngine.setEventListener((event) => {
+  addLog(`speech:${event.phase}:${event.type}${event.detail ? ` => ${event.detail}` : ''}`);
+
+  if (event.phase !== 'recognize' || state.phase !== 'playing' || state.answered) return;
+  if (event.type === 'audiostart') state.mic = 'recording';
+  if (['speechend', 'audioend', 'stop'].includes(event.type)) state.mic = 'transcribing';
+  render();
 });
 
 function escapeHtml(value) {
@@ -78,34 +63,31 @@ function escapeHtml(value) {
 
 function status() {
   return ({
-    unsupported: '此瀏覽器沒有可用的本機語音辨識。',
-    requesting: '正在請求麥克風權限…',
-    'loading-model': state.modelStatus === 'initializing'
-      ? '模型下載完成，正在初始化 Vosk 辨識核心…'
-      : `正在下載日文語音模型${state.modelProgress === null ? '…' : `（${state.modelProgress}%）`}`,
-    arming: '正在準備錄音，看到「現在唸！」再開口',
-    recording: '正在錄音，請現在唸出畫面上的假名',
-    transcribing: '正在手機內辨識語音…',
-    error: `本機語音辨識失敗${state.lastError ? `（${state.lastError}）` : ''}。`,
-    ready: isIOS ? 'iPhone Safari：按開始後請允許麥克風，語音只在手機內處理。' : '語音只在此裝置內處理',
+    unsupported: '此瀏覽器沒有 Web Speech API，仍可使用手動按鈕。',
+    requesting: '正在啟用瀏覽器語音辨識…',
+    arming: '正在啟動辨識，看到「現在唸！」再開口',
+    recording: '瀏覽器已開始收音，請現在唸出畫面上的假名',
+    transcribing: '正在等待瀏覽器回傳辨識結果…',
+    error: `瀏覽器語音辨識失敗${state.lastError ? `（${state.lastError}）` : ''}。`,
+    ready: isIOS
+      ? 'iPhone：請允許語音辨識與麥克風；Chrome 仍受 iOS WebKit 支援狀況影響。'
+      : '使用瀏覽器內建語音辨識，不需下載模型或 API Key。',
   })[state.mic] || '';
 }
 
 function debugPanel() {
   const rows = [
-    ['MediaRecorder', Boolean(window.MediaRecorder)],
-    ['AudioContext', Boolean(window.AudioContext)],
-    ['WebAssembly', Boolean(window.WebAssembly)],
+    ['SpeechRecognition', speechSupported],
+    ['Implementation', recognitionImplementation()],
     ['Secure context', window.isSecureContext],
     ['mediaDevices', Boolean(navigator.mediaDevices)],
     ['iPhone / iPad', isIOS],
-    ['Model ready', state.speechReady],
-    ['Model stage', state.modelStatus || 'idle'],
+    ['Speech ready', state.speechReady],
     ['Mic state', state.mic],
   ];
 
   return `<details class="debug-panel" open>
-    <summary>本機語音辨識 Debug</summary>
+    <summary>Web Speech API Debug</summary>
     <div class="debug-grid">${rows.map(([label, value]) => `<span>${label}</span><b>${String(value)}</b>`).join('')}</div>
     <pre>${escapeHtml(state.logs.join('\n'))}</pre>
     <button type="button" data-copy-debug>複製 Debug 資訊</button>
@@ -114,7 +96,7 @@ function debugPanel() {
 
 function render() {
   app.innerHTML = `<main class="app-shell">
-    <header><p class="eyebrow">80 BPM · vowel challenge</p><h1>Kana Beat</h1></header>
+    <header><p class="eyebrow">${BPM} BPM · vowel challenge</p><h1>Kana Beat</h1></header>
     ${screen()}
     ${debugPanel()}
   </main>`;
@@ -133,11 +115,11 @@ function render() {
 
 function screen() {
   if (state.phase === 'idle') {
-    const starting = ['requesting', 'loading-model'].includes(state.mic);
+    const starting = state.mic === 'requesting';
     return `<section class="panel intro">
       <h2>看到假名，立刻唸出來</h2>
       <p>本局 20 題，只練習 あ・い・う・え・お。</p>
-      <button class="primary" data-start ${starting ? 'disabled' : ''}>${starting ? '準備本機語音中…' : '開始'}</button>
+      <button class="primary" data-start ${starting ? 'disabled' : ''}>${starting ? '準備語音辨識中…' : '開始'}</button>
       <small>${escapeHtml(status())}</small>
     </section>`;
   }
@@ -170,12 +152,11 @@ async function copyDebug() {
   const text = [
     `userAgent=${navigator.userAgent}`,
     `secureContext=${window.isSecureContext}`,
-    `MediaRecorder=${Boolean(window.MediaRecorder)}`,
-    `AudioContext=${Boolean(window.AudioContext)}`,
-    `WebAssembly=${Boolean(window.WebAssembly)}`,
+    `SpeechRecognition=${speechSupported}`,
+    `implementation=${recognitionImplementation()}`,
     `mediaDevices=${Boolean(navigator.mediaDevices)}`,
     `iOS=${isIOS}`,
-    `modelReady=${state.speechReady}`,
+    `speechReady=${state.speechReady}`,
     ...state.logs,
   ].join('\n');
 
@@ -189,26 +170,19 @@ async function copyDebug() {
 }
 
 async function startGame() {
-  if (['requesting', 'loading-model'].includes(state.mic)) return;
+  if (state.mic === 'requesting') return;
   addLog('Start button tapped');
 
-  if (localSpeechSupported) {
+  if (speechSupported) {
     state.mic = 'requesting';
     state.lastError = '';
     render();
     try {
-      await recorder.requestPermission();
-      addLog('microphone permission granted; stream kept warm');
-      state.mic = 'loading-model';
-      state.modelProgress = null;
-      state.modelStatus = 'downloading';
-      render();
       await speechEngine.initialize();
       state.speechReady = true;
       state.mic = 'ready';
-      addLog(`Vosk ready; vocabulary=${speechVocabulary.length}`);
+      addLog(`Web Speech ready; lang=ja-JP; vocabulary=${speechVocabulary.length}`);
     } catch (error) {
-      await recorder.dispose();
       state.mic = 'error';
       state.lastError = error.message || error.name || 'unknown';
       addLog(`speech setup error: ${error.message || error}`);
@@ -241,57 +215,43 @@ function beginBeat() {
   state.feedback = '';
   state.heard = '';
   state.lastError = '';
-  clearTimeout(state.timer);
 
-  if (!localSpeechSupported) state.mic = 'unsupported';
+  if (!speechSupported) state.mic = 'unsupported';
   else if (!state.speechReady) state.mic = 'error';
   else state.mic = 'arming';
   render();
 
-  if (state.speechReady) void startRecording(beatId);
+  if (state.speechReady) void recognizeBeat(beatId);
 }
 
-async function startRecording(beatId) {
+async function recognizeBeat(beatId) {
   try {
     const requestedAt = performance.now();
-    await recorder.start();
-    if (beatId !== state.beatId || state.answered) {
-      await recorder.cancel();
-      return;
-    }
-    state.mic = 'recording';
-    addLog(`recording started; latency=${Math.round(performance.now() - requestedAt)}ms`);
-    render();
-    state.timer = setTimeout(() => void finishRecording(beatId), RECORDING_MS);
-  } catch (error) {
+    const result = await speechEngine.recognize();
     if (beatId !== state.beatId || state.answered) return;
-    state.mic = 'error';
-    state.lastError = `record:${error.name || 'unknown'}`;
-    addLog(`recording error: ${error.message || error}`);
-    render();
-  }
-}
-
-async function finishRecording(beatId) {
-  try {
-    const blob = await recorder.stop();
-    if (beatId !== state.beatId || state.answered) return;
-    addLog(`recording stopped; bytes=${blob.size}; type=${blob.type}`);
     state.mic = 'transcribing';
-    render();
 
-    const text = await speechEngine.transcribe(blob);
-    if (beatId !== state.beatId || state.answered) return;
-    state.heard = text;
-    addLog(`local result => ${text || '(silence)'}`);
+    const ranked = result.alternatives;
+    const selected = ranked.find((alternative) => canonicalVowel(alternative.transcript))
+      || ranked[0]
+      || { transcript: result.transcript, confidence: null, final: false, rank: 0 };
     const expected = canonicalVowel(state.round[state.index][0]);
-    resolveBeat(canonicalVowel(text) === expected);
+    const heard = canonicalVowel(selected.transcript);
+    state.heard = selected.transcript;
+
+    const candidates = ranked.map((alternative) => {
+      const confidence = alternative.confidence === null ? 'n/a' : alternative.confidence.toFixed(3);
+      return `${alternative.transcript} (${confidence}${alternative.final ? ', final' : ', interim'})`;
+    }).join(' | ');
+    addLog(`result ${Math.round(performance.now() - requestedAt)}ms => ${candidates || '(silence)'}`);
+    resolveBeat(Boolean(heard && heard === expected));
   } catch (error) {
     if (beatId !== state.beatId || state.answered) return;
     state.mic = 'error';
-    state.lastError = `transcribe:${error.name || 'unknown'}`;
-    addLog(`transcription error: ${error.message || error}`);
+    state.lastError = error.message || error.name || 'unknown';
+    addLog(`recognition error: ${error.message || error}`);
     render();
+    resolveBeat(false);
   }
 }
 
@@ -299,9 +259,8 @@ function resolveBeat(ok) {
   if (state.answered) return;
   addLog(`resolveBeat(${ok})`);
   state.answered = true;
-  clearTimeout(state.timer);
-  const recorderReady = recorder.cancel();
-  state.mic = state.speechReady ? 'ready' : (localSpeechSupported ? 'error' : 'unsupported');
+  speechEngine.abort();
+  state.mic = state.speechReady ? 'ready' : (speechSupported ? 'error' : 'unsupported');
 
   if (ok) {
     state.correct += 1;
@@ -315,12 +274,10 @@ function resolveBeat(ok) {
   }
   render();
 
-  setTimeout(async () => {
-    await recorderReady;
+  setTimeout(() => {
     state.index += 1;
     if (state.index >= TOTAL) {
       state.phase = 'finished';
-      await recorder.dispose();
       render();
     } else {
       beginBeat();
@@ -328,5 +285,5 @@ function resolveBeat(ok) {
   }, 450);
 }
 
-window.addEventListener('pagehide', () => void recorder.dispose());
+window.addEventListener('pagehide', () => speechEngine.abort());
 render();

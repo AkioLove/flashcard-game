@@ -2,8 +2,9 @@ name: Deploy Kana Beat to GitHub Pages
 
 on:
   push:
-    # Keep the feature branch deployable until iPhone Safari validation is done.
-    branches: [main, feat/local-speech-engine]
+    branches: [main]
+  pull_request:
+    branches: [main]
   workflow_dispatch:
 
 permissions:
@@ -30,6 +31,8 @@ jobs:
         # Browser inference only uses onnxruntime-web. Skip the unrelated
         # onnxruntime-node native download to make Pages builds deterministic.
         run: npm ci --ignore-scripts
+      - name: Test
+        run: npm test
       - name: Build site
         run: npm run build
       - name: Configure Pages
@@ -40,6 +43,7 @@ jobs:
           path: dist
 
   deploy:
+    if: github.event_name != 'pull_request'
     environment:
       name: github-pages
       url: ${{ steps.deployment.outputs.page_url }}

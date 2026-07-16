@@ -2,7 +2,8 @@ name: Deploy Kana Beat to GitHub Pages
 
 on:
   push:
-    branches: [main]
+    # Temporary pre-merge deployment for iPhone Safari validation.
+    branches: [main, feat/local-speech-engine]
   pull_request:
     branches: [main]
   workflow_dispatch:

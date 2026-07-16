@@ -24,15 +24,17 @@ No local setup, speech model download, backend, or API key is required.
 
 - Kana Beat uses `SpeechRecognition` or the prefixed `webkitSpeechRecognition` implementation exposed by the browser.
 - Recognition is configured for `ja-JP`, up to ten alternatives, interim results, and contextual vocabulary hints where the browser supports them.
-- The green **現在唸！** cue appears only after the browser fires `audiostart`, so it reflects the actual listening window rather than a fixed recording timer.
-- Each prompt uses a fresh recognition session. The game checks the first three alternatives and accepts safe recognition variants such as repeated vowels, trailing small kana, and common single-vowel homophones.
+- One continuous recognition stream is opened for the entire round. Browsers that end the stream automatically are reconnected in the background.
+- The game clock never awaits recognition. Each kana gets exactly two 80 BPM beats: a 1.2-second answer window followed by 0.3 seconds of feedback.
+- Interim and final results are matched asynchronously to the prompt active at `speechstart`; stale results from an earlier prompt are ignored.
+- The game checks the first three alternatives and accepts safe recognition variants such as repeated vowels, trailing small kana, and common single-vowel homophones.
 - This is a frontend-only integration with no application server and no API key. The browser vendor may still process speech on its servers, so it is not guaranteed to be offline or device-local.
 
 ## Browser notes
 
 - Desktop Chrome is the recommended test target.
 - On iPhone, Chrome and Safari use Apple's browser engine in most regions and expose the same underlying Web Speech support. Availability and server-side recognition can therefore differ from desktop Chrome.
-- The in-game Debug panel records `start`, `audiostart`, `speechstart`, `result`, error, and timeout events. Copy it when reporting a device failure.
+- The in-game Debug panel records stream sessions, automatic reconnects, `speechstart`, interim/final results, stale-result rejection, and matching decisions. Copy it when reporting a device failure.
 - Manual correct/wrong controls remain available if the browser does not expose or complete speech recognition.
 
 ## Local development

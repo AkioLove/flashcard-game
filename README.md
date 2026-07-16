@@ -28,7 +28,7 @@ No local setup is required.
 - The microphone stream is opened once and reused during a round, so the visible **現在唸！** cue matches the actual recording start.
 - Each recognizer receives its vocabulary from the active kana dataset. Expanding the dataset expands the grammar without changing the speech engine.
 - No recording or transcript is sent to a backend or cloud speech API.
-- `npm run build` downloads the official Apache-2.0 model, verifies its SHA-256 checksum, and packages it for same-origin GitHub Pages delivery. The generated model archive is not committed to Git.
+- `npm run build` downloads a SHA-256-pinned Pages copy prepared from the official Apache-2.0 model. The official ZIP and its own pinned checksum remain the regeneration fallback; the generated model archive is not committed to Git.
 
 ## iPhone Safari
 

@@ -6,8 +6,10 @@ import extract from 'extract-zip';
 import * as tar from 'tar';
 
 const MODEL_NAME = 'vosk-model-small-ja-0.22';
-const MODEL_URL = `https://alphacephei.com/vosk/models/${MODEL_NAME}.zip`;
-const MODEL_SHA256 = 'efa092d280153a77615e9e0c7d7283e93e600de3d19d3bec686c57ef19d52eac';
+const OFFICIAL_ZIP_URL = `https://alphacephei.com/vosk/models/${MODEL_NAME}.zip`;
+const OFFICIAL_ZIP_SHA256 = 'efa092d280153a77615e9e0c7d7283e93e600de3d19d3bec686c57ef19d52eac';
+const PREPARED_MODEL_URL = `https://akiolove.github.io/flashcard-game/models/${MODEL_NAME}.tar.gz`;
+const PREPARED_MODEL_SHA256 = '56376becd136595d6018274aee700e9e37072dd878c0f66a0e7e840948d2fa6d';
 const projectRoot = process.cwd();
 const cacheRoot = path.join(projectRoot, '.cache', 'vosk');
 const zipPath = path.join(cacheRoot, `${MODEL_NAME}.zip`);
@@ -27,22 +29,39 @@ async function sha256(filePath) {
   return createHash('sha256').update(await readFile(filePath)).digest('hex');
 }
 
-async function downloadModel() {
+async function download(url, destination, expectedHash) {
+  const response = await fetch(url);
+  if (!response.ok) throw new Error(`Model download failed: HTTP ${response.status}`);
+  await writeFile(destination, new Uint8Array(await response.arrayBuffer()));
+
+  const actualHash = await sha256(destination);
+  if (actualHash !== expectedHash) {
+    await rm(destination);
+    throw new Error(`Model checksum mismatch: expected ${expectedHash}, received ${actualHash}`);
+  }
+}
+
+async function downloadOfficialZip() {
   if (await exists(zipPath)) {
-    if (await sha256(zipPath) === MODEL_SHA256) return;
+    if (await sha256(zipPath) === OFFICIAL_ZIP_SHA256) return;
     await rm(zipPath);
   }
 
   console.log(`Downloading ${MODEL_NAME} from the official Vosk model repository...`);
-  const response = await fetch(MODEL_URL);
-  if (!response.ok) throw new Error(`Model download failed: HTTP ${response.status}`);
-  await writeFile(zipPath, new Uint8Array(await response.arrayBuffer()));
+  await download(OFFICIAL_ZIP_URL, zipPath, OFFICIAL_ZIP_SHA256);
+}
 
-  const actualHash = await sha256(zipPath);
-  if (actualHash !== MODEL_SHA256) {
-    await rm(zipPath);
-    throw new Error(`Model checksum mismatch: expected ${MODEL_SHA256}, received ${actualHash}`);
-  }
+async function prepareFromOfficialZip() {
+  await downloadOfficialZip();
+  await rm(extractedPath, { recursive: true, force: true });
+  await extract(zipPath, { dir: cacheRoot });
+
+  await tar.create({
+    cwd: cacheRoot,
+    file: outputPath,
+    gzip: true,
+    portable: true,
+  }, [MODEL_NAME]);
 }
 
 async function main() {
@@ -54,16 +73,13 @@ async function main() {
     return;
   }
 
-  await downloadModel();
-  await rm(extractedPath, { recursive: true, force: true });
-  await extract(zipPath, { dir: cacheRoot });
-
-  await tar.create({
-    cwd: cacheRoot,
-    file: outputPath,
-    gzip: true,
-    portable: true,
-  }, [MODEL_NAME]);
+  try {
+    console.log(`Downloading checksum-pinned prepared model from Kana Beat Pages...`);
+    await download(PREPARED_MODEL_URL, outputPath, PREPARED_MODEL_SHA256);
+  } catch (error) {
+    console.warn(`Prepared model download failed; falling back to the official ZIP: ${error.message}`);
+    await prepareFromOfficialZip();
+  }
 
   console.log(`Prepared ${path.relative(projectRoot, outputPath)} (${Math.round((await stat(outputPath)).size / 1_000_000)} MB)`);
 }
